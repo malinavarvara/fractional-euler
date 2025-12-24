@@ -3,12 +3,23 @@ import matplotlib.pyplot as plt
 from scipy.special import gamma
 
 # 1. Функция Миттаг-Леффлера для точного решения
-def mittag_leffler(alpha, beta, z, terms=150): # Увеличено кол-во термов для T=20
+def mittag_leffler(alpha, beta, z, tol=1e-15, max_terms=1000):
+    """
+    Вычисление функции Миттаг-Леффлера с контролем точности.
+    z: аргумент (в нашем случае t^alpha)
+    tol: точность (критерий остановки)
+    """
     result = 0.0
-    for k in range(terms):
-        res_k = z**k / gamma(alpha * k + beta)
-        if np.isinf(res_k): break # Защита от переполнения
-        result += res_k
+    for k in range(max_terms):
+        # Вычисляем текущий член ряда
+        term = z**k / gamma(alpha * k + beta)
+        
+        result += term
+        
+        # Если текущий член стал пренебрежимо мал, выходим
+        if abs(term) < tol and k > 5: # k > 5 чтобы не выйти на первых малых членах
+            break
+            
     return result
 
 def analytical_solution(t, alpha, y0):

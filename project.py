@@ -3,10 +3,23 @@ import matplotlib.pyplot as plt
 from scipy.special import gamma
 
 # 1. Функция Миттаг-Леффлера для аналитического решения E_{alpha, beta}(z)
-def mittag_leffler(alpha, beta, z, terms=100):
+def mittag_leffler(alpha, beta, z, tol=1e-15, max_terms=1000):
+    """
+    Вычисление функции Миттаг-Леффлера с контролем точности.
+    z: аргумент (в нашем случае t^alpha)
+    tol: точность (критерий остановки)
+    """
     result = 0.0
-    for k in range(terms):
-        result += z**k / gamma(alpha * k + beta)
+    for k in range(max_terms):
+        # Вычисляем текущий член ряда
+        term = z**k / gamma(alpha * k + beta)
+        
+        result += term
+        
+        # Если текущий член стал пренебрежимо мал, выходим
+        if abs(term) < tol and k > 5: # k > 5 чтобы не выйти на первых малых членах
+            break
+            
     return result
 
 # Точное решение уравнения D^alpha y = y + t
@@ -79,7 +92,7 @@ if __name__ == "__main__":
     # Параметры задачи
     alpha = 1.8   # Порядок производной
     y0 = 1.0      # Начальное условие
-    t_max = 5.0   # Конечный момент времени
+    t_max = 12.0   # Конечный момент времени
     h = 0.025       # Шаг сетки
 
     # Вычисления
