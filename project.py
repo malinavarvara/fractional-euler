@@ -1,143 +1,267 @@
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.special import gamma
+from scipy.optimize import brentq
 
-# 1. Функция Миттаг-Леффлера для аналитического решения E_{alpha, beta}(z)
-def mittag_leffler(alpha, beta, z, tol=1e-15, max_terms=1000):
-    """
-    Вычисление функции Миттаг-Леффлера с контролем точности.
-    z: аргумент (в нашем случае t^alpha)
-    tol: точность (критерий остановки)
-    """
+def mittag_leffler(alpha, beta, z, tol=1e-15, max_terms=2000):
+    """Вычисление функции Миттаг-Леффлера с двумя параметрами E_{alpha, beta}(z)."""
     result = 0.0
     for k in range(max_terms):
-        # Вычисляем текущий член ряда
         term = z**k / gamma(alpha * k + beta)
-        
         result += term
-        
-        # Если текущий член стал пренебрежимо мал, выходим
-        if abs(term) < tol and k > 5: # k > 5 чтобы не выйти на первых малых членах
+        if abs(term) < tol and k > int(5 + 2/alpha): 
             break
-            
     return result
 
-# Точное решение уравнения D^alpha y = y + t
 def analytical_solution(t, alpha, y0):
+    """Точное решение уравнения D^alpha y(t) = y(t) + t."""
     y_true = np.zeros_like(t)
     for i, val in enumerate(t):
-        # Формула: y(t) = y0*E_{a,1}(t^a) + t^a*E_{a, a+1}(t^a)
+        if val == 0:
+            y_true[i] = y0
+            continue
         term1 = y0 * mittag_leffler(alpha, 1, val**alpha)
-        term2 = (val**alpha) * mittag_leffler(alpha, alpha + 1, val**alpha)
+        term2 = (val**(alpha + 1)) * mittag_leffler(alpha, alpha + 2, val**alpha)
         y_true[i] = term1 + term2
     return y_true
 
-# 2. Численные методы решения дробного уравнения
-def solve_fde_all_methods(alpha, y0, t_end, h):
-    n = int(t_end / h)
-    t = np.linspace(0, t_end, n + 1)
+def generate_custom_grid(alpha, t_end, h, T=None, p=2, delta=1e-12):
+    """
+    Генерация адаптированной сетки H_{T,h} с конца к началу
+    на основе выравнивания локальной погрешности интегратора.
+    """
+    if T is None:
+        T = t_end
+        
+    L = (h**(p + 1)) * (T**(alpha - p))
+    t_nodes = [T]
+    t_i = T
     
-    y_left = np.zeros(n + 1); y_left[0] = y0
-    y_mid = np.zeros(n + 1); y_mid[0] = y0
-    y_trap = np.zeros(n + 1); y_trap[0] = y0
+    while t_i > delta:
+        def eq(x):
+            x_safe = max(x, 1e-50)
+            return ((t_i - x_safe)**(p + 1)) * (x_safe**(alpha - p)) - L
+            
+        try:
+            if alpha - p < 0:
+                left_bound = 1e-15
+            else:
+                left_bound = t_i * (alpha - p) / (alpha + 1)
+                
+            x_root = brentq(eq, left_bound, t_i - 1e-15)
+        except ValueError:
+            x_root = t_i - h
+            
+        if x_root <= delta:
+            break
+            
+        t_nodes.append(x_root)
+        t_i = x_root
+        
+    t_nodes.append(0.0) 
+    t_nodes.reverse()   
     
+    if T < t_end:
+        current = T
+        while current < t_end - 1e-9:
+            current += h
+            if current > t_end: current = t_end
+            t_nodes.append(current)
+            
+    return np.array(t_nodes)
+
+
+def solve_fde_left_rectangles(alpha, y0, t_end, h):
+    """Метод левых прямоугольников (Явный метод Эйлера 1-го порядка)."""
+    t = np.arange(0, t_end + h/2, h) 
+    n = len(t) - 1
+    y = np.zeros(n + 1)
+    y[0] = y0
     coeff = 1 / gamma(alpha)
     
     for i in range(n):
-        tn_next = t[i+1]
-        
-        # --- Метод левых прямоугольников (Явная схема) ---
-        sum_l = 0
+        s = 0
+        T = t[i+1]
         for j in range(i + 1):
-            weight = ((tn_next - t[j])**alpha - (tn_next - t[j+1])**alpha) / alpha
-            sum_l += (y_left[j] + t[j]) * weight
-        y_left[i+1] = y0 + coeff * sum_l
+            w_P = ((T - t[j])**alpha - (T - t[j+1])**alpha) / alpha
+            s += w_P * (y[j] + t[j])
+        y[i+1] = y[0] + coeff * s
+    return y, t
 
-        # --- Метод средних прямоугольников ---
-        sum_m = 0
+def solve_fde_rk2_lubich(alpha, y0, t_end, h):
+    """Метод Рунге-Кутты 2-го порядка (метод Хойна) по Любиху."""
+    t = generate_custom_grid(alpha, t_end, h, T=t_end, p=2)
+    print(f"Генерация сетки для метода РК2 (p=2)...", len(t))
+    n = len(t) - 1 
+    y = np.zeros(n + 1)
+    y[0] = y0
+    
+    p_degree = alpha - 1
+    coeff = 1 / gamma(p_degree)
+    
+    def compute_z(m, y_vals, y_pred=None):
+        if m == 0: return 0.0
+        T = t[m]
+        z_val = 0.0
+        for j in range(m):
+            dt = t[j+1] - t[j]
+            u_j = T - t[j]
+            u_jp1 = T - t[j+1]
+            
+            term1 = (u_j**(p_degree+1) - u_jp1**(p_degree+1)) / (p_degree + 1)
+            term2 = (u_j**p_degree - u_jp1**p_degree) / p_degree
+            w_L = (term1 - u_jp1 * term2) / dt
+            w_R = (u_j * term2 - term1) / dt
+            
+            f_j = y_vals[j] + t[j]
+            f_jp1 = (y_pred + t[j+1]) if (j == m - 1 and y_pred is not None) else (y_vals[j+1] + t[j+1])
+            z_val += w_L * f_j + w_R * f_jp1
+        return coeff * z_val
+
+    for i in range(n):
+        h_i = t[i+1] - t[i]
+        k1 = compute_z(i, y)
+        Y_pred = y[i] + h_i * k1  
+        k2 = compute_z(i+1, y, y_pred=Y_pred)
+        y[i+1] = y[i] + (h_i / 2) * (k1 + k2)  
+    return y, t
+
+def solve_fde_pece(alpha, y0, t_end, h):
+    """Дробный метод Адамса-Башфорта-Мултона (PECE)."""
+    t = np.arange(0, t_end + h/2, h)
+    print(f"Генерация сетки для метода PECE (p=2)...", len(t))
+    n = len(t) - 1
+    y = np.zeros(n + 1)
+    y[0] = y0
+    coeff = 1 / gamma(alpha)
+    
+    for i in range(n):
+        T = t[i+1]
+        
+        # 1. ПРЕДИКТОР
+        s_pred = 0
         for j in range(i + 1):
-            t_mid = (t[j] + t[j+1]) / 2
-            y_mid_point = y_mid[j] # Упрощенный прогноз
-            weight = ((tn_next - t[j])**alpha - (tn_next - t[j+1])**alpha) / alpha
-            sum_m += (y_mid_point + t_mid) * weight
-        y_mid[i+1] = y0 + coeff * sum_m
+            w_P = ((T - t[j])**alpha - (T - t[j+1])**alpha) / alpha
+            s_pred += w_P * (y[j] + t[j])
+        y_pred = y[0] + coeff * s_pred
+        
+        # 2. КОРРЕКТОР
+        s_corr = 0
+        for j in range(i + 1):
+            dt = t[j+1] - t[j]
+            u_j = T - t[j]
+            u_jp1 = T - t[j+1]
+            
+            term1 = (u_j**(alpha+1) - u_jp1**(alpha+1)) / (alpha + 1)
+            term2 = (u_j**alpha - u_jp1**alpha) / alpha
+            w_L = (term1 - u_jp1 * term2) / dt
+            w_R = (u_j * term2 - term1) / dt
+            
+            f_j = y[j] + t[j]
+            f_jp1 = (y_pred + t[i+1]) if j == i else (y[j+1] + t[j+1])
+            s_corr += w_L * f_j + w_R * f_jp1
+            
+        y[i+1] = y[0] + coeff * s_corr
+    return y, t
 
-        # --- Метод Трапеций (Предиктор-Корректор) ---
-        sum_t = 0
-        for j in range(i):
-            w = ((tn_next - t[j])**alpha - (tn_next - t[j+1])**alpha) / alpha
-            f_avg = ((y_trap[j] + t[j]) + (y_trap[j+1] + t[j+1])) / 2
-            sum_t += f_avg * w
-        
-        # Предиктор для последней точки
-        y_pred = y_trap[i] + (h**alpha / gamma(alpha+1)) * (y_trap[i] + t[i])
-        f_avg_last = ((y_trap[i] + t[i]) + (y_pred + tn_next)) / 2
-        w_last = ((tn_next - t[i])**alpha - (tn_next - t[i+1])**alpha) / alpha
-        sum_t += f_avg_last * w_last
-        
-        y_trap[i+1] = y0 + coeff * sum_t
-        
-    return t, y_left, y_mid, y_trap
 
-# 3. Расчет метрик погрешности
+
 def calculate_metrics(y_num, y_true):
-    # Максимальная абсолютная погрешность e_max
     e_max = np.max(np.abs(y_num - y_true))
-    # Среднеквадратическая погрешность RMSE
     rmse = np.sqrt(np.mean((y_num - y_true)**2))
     return e_max, rmse
 
-# --- Основной блок выполнения ---
 if __name__ == "__main__":
-    # Параметры задачи
-    alpha = 1.8   # Порядок производной
-    y0 = 1.0      # Начальное условие
-    t_max = 12.0   # Конечный момент времени
-    h = 0.025       # Шаг сетки
+    alpha = 1.9
+    y0 = 0.0      
+    t_max = 1.0   
+    h = 0.05
 
     # Вычисления
-    t, y_l, y_m, y_t = solve_fde_all_methods(alpha, y0, t_max, h)
-    y_real = analytical_solution(t, alpha, y0)
-
-    # Расчет ошибок
+    y_l, t_val1 = solve_fde_left_rectangles(alpha, y0, t_max, h)
+    y_rk2, t_val2 = solve_fde_rk2_lubich(alpha, y0, t_max, h)
+    y_pece, t_val3 = solve_fde_pece(alpha, y0, t_max, h)
+    
+    y_real1 = analytical_solution(t_val1, alpha, y0)
+    y_real2 = analytical_solution(t_val2, alpha, y0)
+    y_real3 = analytical_solution(t_val3, alpha, y0)
+    
+    # Сбор метрик
     metrics = {
-        "Левые прямоугольники": calculate_metrics(y_l, y_real),
-        "Средние прямоугольники": calculate_metrics(y_m, y_real),
-        "Трапеции": calculate_metrics(y_t, y_real)
+        "Левые прямоуг. (равномерная)": calculate_metrics(y_l, y_real1),
+        "РК2 (VIDE, адаптивная)": calculate_metrics(y_rk2, y_real2),
+        "PECE (Адамс, равномерная)": calculate_metrics(y_pece, y_real3),
     }
 
-    # Вывод в консоль
-    print(f"{'Метод':<25} | {'e_max':<12} | {'RMSE':<12}")
-    print("-" * 55)
+    print(f"{'Метод':<30} | {'e_max':<12} | {'RMSE':<12}")
+    print("-" * 60)
     for method, (emax, rmse) in metrics.items():
-        print(f"{method:<25} | {emax:<12.5e} | {rmse:<12.5e}")
+        print(f"{method:<30} | {emax:<12.5e} | {rmse:<12.5e}")
 
-    # Визуализация
-    plt.figure(figsize=(15, 6))
+    # Построение графиков
+    plt.figure(figsize=(14, 6))
 
-    # График 1: Решения
+    # 1. Решения
     plt.subplot(1, 2, 1)
-    plt.plot(t, y_real, 'k--', label='Аналитическое ($E_{\\alpha, \\beta}$)', linewidth=2.5)
-    plt.plot(t, y_l, 'r-', label='Левые прямоуг.', alpha=0.7)
-    plt.plot(t, y_m, 'g-', label='Средние прямоуг.', alpha=0.7)
-    plt.plot(t, y_t, 'b-', label='Трапеции', alpha=0.7)
-    plt.xlabel('t')
-    plt.ylabel('y(t)')
-    plt.title(f'Решение уравнения $D^{{{alpha}}}y = y + t$')
-    plt.legend()
+    plt.plot(t_val2, y_real2, 'k--', label='Аналитическое', linewidth=2)
+    plt.plot(t_val1, y_l, 'r-', label='Явный Эйлер (равномерная)', alpha=0.8)
+    plt.plot(t_val2, y_rk2, 'c-', label='РК2 (адаптивная сетка)', alpha=0.8)
+    plt.plot(t_val3, y_pece, 'm-', label='PECE (равномерная)', alpha=0.8)
+    plt.xlabel('t', fontsize=12)
+    plt.ylabel('y(t)', fontsize=12)
+    plt.title(f'Решение уравнения $D^{{{alpha}}}y = y + t$',  fontsize=14)
+    plt.legend(fontsize=10)
     plt.grid(True, linestyle='--', alpha=0.6)
 
-    # График 2: Погрешности
+    # 2. Погрешности
     plt.subplot(1, 2, 2)
-    plt.plot(t, np.abs(y_l - y_real), 'r-', label='Ошибка левых')
-    plt.plot(t, np.abs(y_m - y_real), 'g-', label='Ошибка средних')
-    plt.plot(t, np.abs(y_t - y_real), 'b-', label='Ошибка трапеций')
-    plt.yscale('log') # Логарифмическая шкала для лучшей видимости разницы
-    plt.xlabel('t')
-    plt.ylabel('Абсолютная ошибка')
-    plt.title('Погрешность методов (логарифмическая шкала)')
-    plt.legend()
+    plt.plot(t_val1, np.abs(y_l - y_real1), 'r-', label='Ошибка Явного Эйлера')
+    plt.plot(t_val2, np.abs(y_rk2 - y_real2), 'c-', label='Ошибка РК2 (адаптивная)')
+    plt.plot(t_val3, np.abs(y_pece - y_real3), 'm-', label='Ошибка PECE', linewidth=2)
+    
+    plt.yscale('log')
+    plt.xlabel('t', fontsize=12)
+    plt.ylabel('Абсолютная ошибка |y_num - y_exact|', fontsize=12)
+    plt.title('Анализ погрешности методов', fontsize=14)
+    plt.legend(fontsize=10)
     plt.grid(True, which="both", linestyle='--', alpha=0.5)
 
     plt.tight_layout()
+    plt.show()
+    
+    # === ГЕНЕРАЦИЯ СПЕЦИАЛЬНОГО ГРАФИКА ДЛЯ ГЛАВЫ 3 ===
+    print("\nГенерация сводного графика для альфа = 1.1 и 1.9...")
+    plt.figure(figsize=(14, 6))
+    
+    alphas_to_plot = [1.1, 1.9]
+    h_test = 0.05
+    num_test = int((t_max - 0) / h_test) + 1
+    t_unif = np.linspace(0, t_max, num_test)
+    
+    for i, alpha_val in enumerate(alphas_to_plot):
+        # Вычисления для конкретного альфа
+        y_l_a, t_val1_a = solve_fde_left_rectangles(alpha_val, y0, t_max, h_test)
+        y_rk2_a, t_val2_a = solve_fde_rk2_lubich(alpha_val, y0, t_max, h_test)
+        y_pece_a, t_val3_a = solve_fde_pece(alpha_val, y0, t_max, h_test)
+        
+        y_real1_a = analytical_solution(t_val1_a, alpha_val, y0)
+        y_real2_a = analytical_solution(t_val2_a, alpha_val, y0)
+        y_real3_a = analytical_solution(t_val3_a, alpha_val, y0)
+        
+        # Строим график ошибки в соответствующей панели (слева или справа)
+        plt.subplot(1, 2, i + 1)
+        plt.plot(t_val1_a, np.abs(y_l_a - y_real1_a), 'r-', label='Ошибка Явного Эйлера')
+        plt.plot(t_val2_a, np.abs(y_rk2_a - y_real2_a), 'c-', label='Ошибка РК2 (адаптивная)')
+        plt.plot(t_val3_a, np.abs(y_pece_a - y_real3_a), 'm-', label='Ошибка PECE', linewidth=2)
+        
+        plt.yscale('log')
+        plt.xlabel('t', fontsize=12)
+        plt.ylabel('Абсолютная ошибка |y_num - y_exact|', fontsize=12)
+        plt.title(f'Анализ погрешности при $\\alpha={alpha_val}$', fontsize=14)
+        plt.legend(fontsize=10)
+        plt.grid(True, which="both", linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    # Сохраняем картинку прямо в папку со скриптом, чтобы сразу вставить в диплом!
+    plt.savefig('Figure_3_alpha_comparison.png', dpi=300)
     plt.show()
